@@ -5314,10 +5314,10 @@ impl JsModuleResolver for PiJsResolver {
         // containing no-op exports matching the import declaration.
         if spec.starts_with('.') && repair_mode.allows_aggressive() {
             let state = self.state.borrow();
-            let roots = state.extension_roots.clone();
+            let canonical_roots = state.canonical_extension_roots.clone();
             drop(state);
 
-            if let Some(escaped_path) = detect_monorepo_escape(base, spec, &roots) {
+            if let Some(escaped_path) = detect_monorepo_escape(base, spec, &canonical_roots) {
                 // Read the importing file to extract import names.
                 let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let names = extract_import_names(&source, spec);
@@ -6015,7 +6015,7 @@ fn require_destructure_regex() -> &'static regex::Regex {
 fn detect_monorepo_escape(
     base: &str,
     specifier: &str,
-    extension_roots: &[PathBuf],
+    canonical_extension_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     if !specifier.starts_with('.') {
         return None;
@@ -6027,9 +6027,8 @@ fn detect_monorepo_escape(
     // if the path doesn't exist on disk, avoiding path traversal bypasses.
     let effective = crate::extensions::safe_canonicalize(&resolved);
 
-    for root in extension_roots {
-        let canonical_root = crate::extensions::safe_canonicalize(root);
-        if effective.starts_with(&canonical_root) {
+    for canonical_root in canonical_extension_roots {
+        if effective.starts_with(canonical_root) {
             return None; // Within an extension root — not an escape
         }
     }
@@ -13583,9 +13582,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// to access.  Called before loading each extension so it can read its own
     /// bundled assets (HTML templates, markdown docs, etc.).
     pub fn add_allowed_read_root(&self, root: PathBuf) {
+        let canonical_root = crate::extensions::safe_canonicalize(&root);
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
-            if !roots.contains(&root) {
-                roots.push(root);
+            if !roots.contains(&canonical_root) {
+                roots.push(canonical_root);
             }
         }
     }
@@ -14288,8 +14288,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
                                 roots.iter().any(|root| {
-                                    let canonical_root = crate::extensions::safe_canonicalize(root);
-                                    checked_path.starts_with(&canonical_root)
+                                    checked_path.starts_with(root)
                                 })
                             });
 
@@ -14379,9 +14378,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                                                 allowed_read_roots.lock()
                                                             {
                                                                 for root in roots.iter() {
-                                                                    let canonical_root = crate::extensions::safe_canonicalize(root);
                                                                     if canonical_ancestor
-                                                                        .starts_with(&canonical_root)
+                                                                        .starts_with(root)
                                                                     {
                                                                         return Ok(
                                                                             requested_abs.clone()
@@ -14405,8 +14403,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         let in_ext_root =
                                             allowed_read_roots.lock().is_ok_and(|roots| {
                                                 roots.iter().any(|root| {
-                                                    let canonical_root = crate::extensions::safe_canonicalize(root);
-                                                    checked_path.starts_with(&canonical_root)
+                                                    checked_path.starts_with(root)
                                                 })
                                             });
 
@@ -14486,8 +14483,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
                                     roots.iter().any(|root| {
-                                        let canonical_root = crate::extensions::safe_canonicalize(root);
-                                        secure_path.starts_with(&canonical_root)
+                                        secure_path.starts_with(root)
                                     })
                                 });
                                 let allowed =
@@ -14553,8 +14549,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                                     }
                                                     if let Ok(roots) = allowed_read_roots.lock() {
                                                         for root in roots.iter() {
-                                                            let canonical_root = crate::extensions::safe_canonicalize(root);
-                                                            if canonical_ancestor.starts_with(&canonical_root)
+                                                            if canonical_ancestor.starts_with(root)
                                                             {
                                                                 return Ok(requested_abs.clone());
                                                             }
@@ -14577,8 +14572,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 // extension root directory.
                                 let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
                                     roots.iter().any(|root| {
-                                        let canonical_root = crate::extensions::safe_canonicalize(root);
-                                        checked_path.starts_with(&canonical_root)
+                                        checked_path.starts_with(root)
                                     })
                                 });
                                 let allowed =
@@ -18979,25 +18973,26 @@ import { isIPv4 as netIsIpv4 } from "node:net";
 
         let mode = RepairMode::default();
         let roots = vec![root.to_path_buf()];
+        let canonical_roots = roots.iter().map(|p| crate::extensions::safe_canonicalize(p)).collect::<Vec<_>>();
 
         let resolved_pkg =
-            resolve_module_path(base.to_string_lossy().as_ref(), "./pkg", mode, &roots)
+            resolve_module_path(base.to_string_lossy().as_ref(), "./pkg", mode, &roots, &canonical_roots)
                 .expect("resolve ./pkg");
         assert_eq!(resolved_pkg, pkg_index_ts);
 
         let resolved_module =
-            resolve_module_path(base.to_string_lossy().as_ref(), "./module", mode, &roots)
+            resolve_module_path(base.to_string_lossy().as_ref(), "./module", mode, &roots, &canonical_roots)
                 .expect("resolve ./module");
         assert_eq!(resolved_module, module_ts);
 
         let resolved_json =
-            resolve_module_path(base.to_string_lossy().as_ref(), "./only_json", mode, &roots)
+            resolve_module_path(base.to_string_lossy().as_ref(), "./only_json", mode, &roots, &canonical_roots)
                 .expect("resolve ./only_json");
         assert_eq!(resolved_json, only_json);
 
         let file_url = format!("file://{}", module_ts.display());
         let resolved_file_url =
-            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots)
+            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots, &canonical_roots)
                 .expect("file://");
         assert_eq!(resolved_file_url, module_ts);
     }
@@ -19017,9 +19012,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
 
         let mode = RepairMode::default();
         let roots = vec![extension_root];
+        let canonical_roots = roots.iter().map(|p| crate::extensions::safe_canonicalize(p)).collect::<Vec<_>>();
         let file_url = format!("file://{}", outside.display());
         let resolved =
-            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots);
+            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots, &canonical_roots);
         assert!(
             resolved.is_none(),
             "file:// import outside extension root should be blocked, got {resolved:?}"
@@ -19041,9 +19037,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
 
         let mode = RepairMode::default();
         let roots = vec![extension_root];
+        let canonical_roots = roots.iter().map(|p| crate::extensions::safe_canonicalize(p)).collect::<Vec<_>>();
         let file_url = format!("file://{}", inside.display());
         let resolved =
-            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots);
+            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode, &roots, &canonical_roots);
         assert_eq!(resolved, Some(inside));
     }
 
