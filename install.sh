@@ -1926,11 +1926,6 @@ install_completions_for_shell() {
     return 0
   fi
 
-  if [ "$root_help_ok" -eq 0 ] && [ -n "$timeout_cmd" ] && [ "$should_probe_subcommands" -eq 1 ]; then
-    local probe_rc=0
-    probe_rc=0
-  fi
-
   if [ -z "$subcommand" ]; then
     COMPLETIONS_STATUS="skipped (unsupported by this pi build)"
     info "Shell completions: skipped (binary has no completion subcommand)"
