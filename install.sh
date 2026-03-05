@@ -1852,11 +1852,86 @@ install_completions_for_shell() {
   fi
 
   local subcommand=""
-  if "$bin" completions --help >/dev/null 2>&1; then
-    subcommand="completions"
-  elif "$bin" completion --help >/dev/null 2>&1; then
-    subcommand="completion"
+  local timeout_cmd=""
+  local probe_timeout="${PI_INSTALLER_COMPLETION_PROBE_TIMEOUT:-3}"
+  local generation_timeout="${PI_INSTALLER_COMPLETION_CMD_TIMEOUT:-10}"
+  timeout_cmd="$(version_timeout_cmd)"
+
+  # Prefer static command discovery from top-level --help (safe, fast path).
+  # If that fails, fall back to legacy subcommand probes guarded by a timeout.
+  local root_help=""
+  local root_help_ok=0
+  local should_probe_subcommands=0
+  if [ -n "$timeout_cmd" ]; then
+    if root_help=$("$timeout_cmd" "$probe_timeout" "$bin" --help 2>/dev/null); then
+      root_help_ok=1
+    fi
   else
+    if root_help=$("$bin" --help 2>/dev/null); then
+      root_help_ok=1
+    fi
+  fi
+
+  if [ "$root_help_ok" -eq 1 ]; then
+    if printf '%s\n' "$root_help" | grep -Eq '^[[:space:]]+completions([[:space:]]|$)'; then
+      subcommand="completions"
+    elif printf '%s\n' "$root_help" | grep -Eq '^[[:space:]]+completion([[:space:]]|$)'; then
+      subcommand="completion"
+    else
+      should_probe_subcommands=1
+    fi
+  else
+    should_probe_subcommands=1
+  fi
+
+  if [ "$should_probe_subcommands" -eq 1 ]; then
+    # Help probe was unavailable or inconclusive: guard runtime probes with timeout.
+    if [ -z "$timeout_cmd" ]; then
+      if [ "$root_help_ok" -eq 0 ]; then
+        COMPLETIONS_STATUS="skipped (completion probe unavailable)"
+        info "Shell completions: skipped (unable to safely probe completion support)"
+      fi
+      # If --help was inconclusive and no timeout tool exists, fail open and skip.
+      # We intentionally avoid unbounded runtime probes in this branch.
+      subcommand=""
+    else
+      local probe_rc=0
+      local probe_timed_out=0
+      if "$timeout_cmd" "$probe_timeout" "$bin" completions --help >/dev/null 2>&1; then
+        subcommand="completions"
+      else
+        probe_rc=$?
+        if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
+          probe_timed_out=1
+        fi
+        if "$timeout_cmd" "$probe_timeout" "$bin" completion --help >/dev/null 2>&1; then
+          subcommand="completion"
+        else
+          probe_rc=$?
+          if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
+            probe_timed_out=1
+          fi
+        fi
+      fi
+
+      if [ -z "$subcommand" ] && [ "$probe_timed_out" -eq 1 ]; then
+        COMPLETIONS_STATUS="failed (completion probe timed out)"
+        warn "Shell completions probe timed out; skipping completion installation"
+        return 1
+      fi
+    fi
+  fi
+
+  if [ -z "$subcommand" ] && [ "$root_help_ok" -eq 0 ] && [ -z "$timeout_cmd" ]; then
+    return 0
+  fi
+
+  if [ "$root_help_ok" -eq 0 ] && [ -n "$timeout_cmd" ] && [ "$should_probe_subcommands" -eq 1 ]; then
+    local probe_rc=0
+    probe_rc=0
+  fi
+
+  if [ -z "$subcommand" ]; then
     COMPLETIONS_STATUS="skipped (unsupported by this pi build)"
     info "Shell completions: skipped (binary has no completion subcommand)"
     return 0
@@ -1886,7 +1961,20 @@ install_completions_for_shell() {
   fi
 
   local completion_output
-  if ! completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null); then
+  if [ -n "$timeout_cmd" ]; then
+    local completion_rc=0
+    completion_output=$("$timeout_cmd" "$generation_timeout" "$bin" "$subcommand" "$shell_name" 2>/dev/null) || completion_rc=$?
+    if [ "$completion_rc" -ne 0 ]; then
+      if [ "$completion_rc" -eq 124 ] || [ "$completion_rc" -eq 137 ]; then
+        COMPLETIONS_STATUS="failed (completion generation timed out)"
+        warn "Failed to generate $shell_name completions (timed out)"
+        return 1
+      fi
+      COMPLETIONS_STATUS="failed (completion generation error)"
+      warn "Failed to generate $shell_name completions"
+      return 1
+    fi
+  elif ! completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null); then
     COMPLETIONS_STATUS="failed (completion generation error)"
     warn "Failed to generate $shell_name completions"
     return 1

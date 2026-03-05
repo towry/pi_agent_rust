@@ -179,9 +179,40 @@ if [ "\${1:-}" = "--version" ]; then
   exit 0
 fi
 
+if [ "\${1:-}" = "--help" ]; then
+  case "\${MODE}" in
+    help_lists_completions)
+      cat <<'HELP'
+Usage: pi [OPTIONS] [ARGS]... [COMMAND]
+
+Commands:
+  completions  Generate shell completions
+  help         Print this message
+HELP
+      exit 0
+      ;;
+    help_inconclusive_probe_ok)
+      cat <<'HELP'
+Usage: pi [OPTIONS] [ARGS]... [COMMAND]
+
+Commands:
+  help  Print this message
+HELP
+      exit 0
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+fi
+
 if [ "\${1:-}" = "completions" ]; then
   if [ "\${2:-}" = "--help" ]; then
     if [ "\${MODE}" = "unsupported" ]; then
+      exit 1
+    fi
+    if [ "\${MODE}" = "completion_probe_hang" ]; then
+      sleep "\${STUB_COMPLETION_SLEEP_SECS:-30}"
       exit 1
     fi
     exit 0
@@ -213,6 +244,34 @@ if [ "\${1:-}" = "completions" ]; then
           ;;
       esac
       ;;
+    help_lists_completions|help_inconclusive_probe_ok)
+      case "\${2:-}" in
+        bash)
+          echo "# bash completion for pi fixture"
+          exit 0
+          ;;
+        zsh)
+          echo "#compdef pi"
+          exit 0
+          ;;
+        fish)
+          echo "complete -c pi"
+          exit 0
+          ;;
+        *)
+          exit 1
+          ;;
+      esac
+      ;;
+    completion_hang)
+      sleep "\${STUB_COMPLETION_SLEEP_SECS:-30}"
+      echo "# delayed completion output"
+      exit 0
+      ;;
+    completion_probe_hang)
+      sleep "\${STUB_COMPLETION_SLEEP_SECS:-30}"
+      exit 1
+      ;;
     *)
       exit 1
       ;;
@@ -221,6 +280,9 @@ fi
 
 if [ "\${1:-}" = "completion" ]; then
   if [ "\${2:-}" = "--help" ]; then
+    if [ "\${MODE}" = "completion_probe_hang" ]; then
+      sleep "\${STUB_COMPLETION_SLEEP_SECS:-30}"
+    fi
     exit 1
   fi
   exit 1
@@ -1330,6 +1392,106 @@ test_completions_success_writes_file() {
   fi
 }
 
+test_completions_help_discovery_path_succeeds() {
+  local dir artifact artifact_url checksum completion_file
+  dir="$(case_dir "completions-help-discovery")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "help_lists_completions"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --completions bash
+
+  completion_file="${dir}/data/bash-completion/completions/pi"
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Installed bash completions to"
+  assert_output_contains "$dir" "Shell:     installed (bash)"
+  [ -f "$completion_file" ] || { echo "expected completion file: ${completion_file}" >&2; return 1; }
+}
+
+test_completions_help_inconclusive_falls_back_to_probe() {
+  local dir artifact artifact_url checksum completion_file
+  dir="$(case_dir "completions-help-inconclusive")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "help_inconclusive_probe_ok"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --completions bash
+
+  completion_file="${dir}/data/bash-completion/completions/pi"
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Installed bash completions to"
+  assert_output_contains "$dir" "Shell:     installed (bash)"
+  [ -f "$completion_file" ] || { echo "expected completion file: ${completion_file}" >&2; return 1; }
+}
+
+test_completions_probe_timeout_is_non_fatal() {
+  local dir artifact artifact_url checksum
+  dir="$(case_dir "completions-probe-timeout")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "completion_probe_hang"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  PI_INSTALLER_COMPLETION_PROBE_TIMEOUT=1 \
+  STUB_COMPLETION_SLEEP_SECS=3 \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --completions bash
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Shell completions probe timed out; skipping completion installation"
+  assert_output_contains "$dir" "Shell:     failed (completion probe timed out)"
+}
+
+test_completions_generation_timeout_is_non_fatal() {
+  local dir artifact artifact_url checksum
+  dir="$(case_dir "completions-generation-timeout")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "completion_hang"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  PI_INSTALLER_COMPLETION_CMD_TIMEOUT=1 \
+  STUB_COMPLETION_SLEEP_SECS=3 \
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --completions bash
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Failed to generate bash completions (timed out)"
+  assert_output_contains "$dir" "Shell:     failed (completion generation timed out)"
+}
+
 main() {
   if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
@@ -1369,6 +1531,10 @@ main() {
   run_test test_completions_unsupported_build_soft_skip
   run_test test_completions_generation_failure_recorded
   run_test test_completions_success_writes_file
+  run_test test_completions_help_discovery_path_succeeds
+  run_test test_completions_help_inconclusive_falls_back_to_probe
+  run_test test_completions_probe_timeout_is_non_fatal
+  run_test test_completions_generation_timeout_is_non_fatal
 
   echo ""
   echo "work dir: ${WORK_ROOT}"
