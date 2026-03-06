@@ -4921,6 +4921,19 @@ impl AgentSession {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn resolve_extension_policy_for_enable(
+        config: Option<&crate::config::Config>,
+        policy: Option<ExtensionPolicy>,
+    ) -> ExtensionPolicy {
+        policy.unwrap_or_else(|| {
+            config.map_or_else(
+                || crate::config::Config::default().resolve_extension_policy(None),
+                |cfg| cfg.resolve_extension_policy(None),
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn enable_extensions(
         &mut self,
         enabled_tools: &[&str],
@@ -4972,7 +4985,7 @@ impl AgentSession {
             ));
         }
 
-        let resolved_policy = policy.clone().unwrap_or_default();
+        let resolved_policy = Self::resolve_extension_policy_for_enable(config, policy);
         let resolved_repair_policy = repair_policy
             .or_else(|| config.map(|cfg| cfg.resolve_repair_policy(None)))
             .unwrap_or(RepairPolicyMode::AutoSafe);
@@ -5156,7 +5169,7 @@ impl AgentSession {
 
         #[cfg(feature = "wasm-host")]
         if !wasm_specs.is_empty() {
-            let host = WasmExtensionHost::new(cwd, policy.unwrap_or_default())?;
+            let host = WasmExtensionHost::new(cwd, resolved_policy.clone())?;
             manager
                 .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
                 .await?;
@@ -5790,6 +5803,42 @@ mod tests {
         > {
             Ok(Box::pin(futures::stream::empty()))
         }
+    }
+
+    #[test]
+    fn enable_extensions_policy_resolution_defaults_to_permissive() {
+        let policy = AgentSession::resolve_extension_policy_for_enable(None, None);
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Permissive);
+    }
+
+    #[test]
+    fn enable_extensions_policy_resolution_respects_config_default_toggle() {
+        let config = crate::config::Config {
+            extension_policy: Some(crate::config::ExtensionPolicyConfig {
+                profile: None,
+                default_permissive: Some(false),
+                allow_dangerous: None,
+            }),
+            ..Default::default()
+        };
+        let policy = AgentSession::resolve_extension_policy_for_enable(Some(&config), None);
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
+    }
+
+    #[test]
+    fn enable_extensions_policy_resolution_prefers_explicit_policy() {
+        let config = crate::config::Config {
+            extension_policy: Some(crate::config::ExtensionPolicyConfig {
+                profile: None,
+                default_permissive: Some(false),
+                allow_dangerous: None,
+            }),
+            ..Default::default()
+        };
+        let explicit = crate::extensions::PolicyProfile::Permissive.to_policy();
+        let policy =
+            AgentSession::resolve_extension_policy_for_enable(Some(&config), Some(explicit));
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Permissive);
     }
 
     #[test]

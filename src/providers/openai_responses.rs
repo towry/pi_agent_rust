@@ -654,32 +654,29 @@ where
     }
 
     fn end_tool_call(&mut self, item_id: &str, call_id: &str, name: &str, arguments: &str) {
-        let (mut tc, synthesized_start) =
-            self.tool_calls_by_item_id
-                .remove(item_id)
-                .map_or_else(
-                    || {
-                        // If we missed the added event, synthesize the full tool-call block now
-                        // so downstream consumers still see a valid Start → Delta? → End sequence.
-                        let content_index = self.partial.content.len();
-                        self.partial.content.push(ContentBlock::ToolCall(ToolCall {
-                            id: call_id.to_string(),
-                            name: name.to_string(),
-                            arguments: serde_json::Value::Null,
-                            thought_signature: None,
-                        }));
-                        (
-                            ToolCallState {
-                                content_index,
-                                call_id: call_id.to_string(),
-                                name: name.to_string(),
-                                arguments: String::new(),
-                            },
-                            true,
-                        )
+        let (mut tc, synthesized_start) = self.tool_calls_by_item_id.remove(item_id).map_or_else(
+            || {
+                // If we missed the added event, synthesize the full tool-call block now
+                // so downstream consumers still see a valid Start → Delta? → End sequence.
+                let content_index = self.partial.content.len();
+                self.partial.content.push(ContentBlock::ToolCall(ToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: serde_json::Value::Null,
+                    thought_signature: None,
+                }));
+                (
+                    ToolCallState {
+                        content_index,
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        arguments: String::new(),
                     },
-                    |state| (state, false),
-                );
+                    true,
+                )
+            },
+            |state| (state, false),
+        );
 
         if synthesized_start {
             self.pending_events.push_back(StreamEvent::ToolCallStart {
