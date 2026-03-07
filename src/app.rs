@@ -385,7 +385,7 @@ pub fn select_model_and_thinking(
         }
         selected_model = found;
     } else if let Some(provider) = cli.provider.as_deref() {
-        let mut candidates: Vec<ModelEntry> = registry
+        let candidates: Vec<ModelEntry> = registry
             .models()
             .iter()
             .filter(|m| provider_ids_match(&m.model.provider, provider))
@@ -394,11 +394,17 @@ pub fn select_model_and_thinking(
         if candidates.is_empty() {
             bail!("No models available for provider {provider}");
         }
-        if let Some(found) = candidates.iter().find(|m| model_entry_is_ready(m)) {
-            selected_model = Some(found.clone());
+        let ready_candidates: Vec<ModelEntry> = candidates
+            .iter()
+            .filter(|entry| model_entry_is_ready(entry))
+            .cloned()
+            .collect();
+        let preferred_pool = if ready_candidates.is_empty() {
+            candidates.as_slice()
         } else {
-            selected_model = Some(candidates.remove(0));
-        }
+            ready_candidates.as_slice()
+        };
+        selected_model = Some(default_model_from_candidates(preferred_pool));
     } else if let Some(model_id) = cli.model.as_deref() {
         if let Some((provider, scoped_model_id)) = split_provider_model_spec(model_id) {
             selected_model = registry
@@ -1360,6 +1366,24 @@ mod tests {
 
         assert_eq!(selection.model_entry.model.provider, "acme");
         assert_eq!(selection.model_entry.model.id, "local-model");
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_prefers_provider_default_over_registry_order() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "openai"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-4o", "openai", true),
+            test_model_entry("gpt-5.4", "openai", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider-only selection should honor preferred defaults");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, "gpt-5.4");
     }
 
     #[test]
