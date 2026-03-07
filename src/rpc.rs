@@ -146,14 +146,22 @@ fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
             timestamp,
         });
     }
-    let mut blocks = vec![ContentBlock::Text(TextContent::new(text.to_string()))];
-    for image in images {
-        blocks.push(ContentBlock::Image(image.clone()));
-    }
+    let blocks = build_prompt_content_blocks(text, images);
     Message::User(UserMessage {
         content: UserContent::Blocks(blocks),
         timestamp,
     })
+}
+
+fn build_prompt_content_blocks(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if !text.trim().is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(text.to_string())));
+    }
+    for image in images {
+        blocks.push(ContentBlock::Image(image.clone()));
+    }
+    blocks
 }
 
 fn is_extension_command(message: &str, expanded: &str) -> bool {
@@ -1795,10 +1803,7 @@ async fn run_prompt_with_retry(
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
                     .await
             } else {
-                let mut blocks = vec![ContentBlock::Text(TextContent::new(message.clone()))];
-                for image in &images {
-                    blocks.push(ContentBlock::Image(image.clone()));
-                }
+                let blocks = build_prompt_content_blocks(&message, &images);
                 guard
                     .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                     .await
@@ -4264,6 +4269,25 @@ mod tests {
                 assert_eq!(blocks.len(), 2);
                 assert!(matches!(&blocks[0], ContentBlock::Text(_)));
                 assert!(matches!(&blocks[1], ContentBlock::Image(_)));
+            }
+            other => unreachable!("expected different match, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_user_message_image_only_omits_empty_text_block() {
+        let images = vec![ImageContent {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let msg = build_user_message("", &images);
+        match msg {
+            Message::User(UserMessage {
+                content: UserContent::Blocks(blocks),
+                ..
+            }) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(&blocks[0], ContentBlock::Image(_)));
             }
             other => unreachable!("expected different match, got: {other:?}"),
         }
