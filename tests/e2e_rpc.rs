@@ -13,7 +13,11 @@ use common::TestHarness;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::auth::AuthStorage;
 use pi::config::Config;
-use pi::extensions::{ExtensionManager, ExtensionRegion, ExtensionUiRequest};
+use pi::extensions::{
+    ExtensionManager, ExtensionRegion, ExtensionUiRequest, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::PiJsRuntimeConfig;
 use pi::http::client::Client;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
 use pi::models::ModelEntry;
@@ -1615,6 +1619,59 @@ fn build_agent_session_with_extensions(
     (agent_session, manager)
 }
 
+async fn build_agent_session_with_js_extension(
+    session: Session,
+    cassette_dir: &Path,
+    harness: &TestHarness,
+    source: &str,
+) -> (AgentSession, ExtensionManager) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let ext_entry_path = harness.create_file("extensions/ext.mjs", source.as_bytes());
+    let spec = JsExtensionLoadSpec::from_entry_path(&ext_entry_path).expect("load spec");
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+    let runtime = JsExtensionRuntimeHandle::start(js_config, tools, manager.clone())
+        .await
+        .expect("start js runtime");
+    manager.set_js_runtime(runtime);
+    manager
+        .load_js_extensions(vec![spec])
+        .await
+        .expect("load extension");
+
+    let mut agent_session = build_agent_session(session, cassette_dir);
+    agent_session.extensions = Some(ExtensionRegion::new(manager.clone()));
+    (agent_session, manager)
+}
+
+const SESSION_SWITCH_CANCEL_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("session_before_switch", () => ({ cancelled: true }));
+}
+"#;
+
+const SESSION_SWITCH_RECORD_EXT: &str = r#"
+export default function init(pi) {
+    const events = [];
+
+    pi.on("session_before_switch", () => ({ cancelled: false }));
+    pi.on("session_switch", (event) => {
+        events.push(event);
+        return null;
+    });
+
+    pi.registerCommand("get-events", {
+        description: "Return recorded session switch events",
+        handler: async () => JSON.stringify(events),
+    });
+}
+"#;
+
 /// Wait for an `extension_ui_request` event on the RPC output channel.
 /// Skips any non-event / non-ui-request lines.
 async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
@@ -1648,6 +1705,237 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
         );
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RPC session switch hooks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_new_session_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("rpc_new_session_can_be_cancelled_by_extension");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let session = Session::in_memory();
+        let original_session_id = session.header.id.clone();
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            session,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_CANCEL_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"new_session"}"#,
+            "new_session(cancelled)",
+        )
+        .await;
+        assert_ok(&resp, "new_session");
+        assert_eq!(resp["data"]["cancelled"], true);
+
+        let state = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"2","type":"get_state"}"#,
+            "get_state(after cancelled new_session)",
+        )
+        .await;
+        assert_ok(&state, "get_state");
+        assert_eq!(state["data"]["sessionId"], original_session_id);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_switch_session_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("rpc_switch_session_can_be_cancelled_by_extension");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let session = Session::in_memory();
+        let original_session_id = session.header.id.clone();
+
+        let target_root = tempfile::tempdir().expect("target session dir");
+        let mut target = Session::create_with_dir(Some(target_root.path().to_path_buf()));
+        target.append_message(SessionMessage::User {
+            content: UserContent::Text("target".to_string()),
+            timestamp: Some(1_700_000_000_000),
+        });
+        target.save().await.expect("save target session");
+        let target_path = target
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("target session path");
+
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            session,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_CANCEL_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let cmd = json!({
+            "id": "1",
+            "type": "switch_session",
+            "sessionPath": target_path,
+        })
+        .to_string();
+        let resp = send_recv(&in_tx, &out_rx, &cmd, "switch_session(cancelled)").await;
+        assert_ok(&resp, "switch_session");
+        assert_eq!(resp["data"]["cancelled"], true);
+
+        let state = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"2","type":"get_state"}"#,
+            "get_state(after cancelled switch_session)",
+        )
+        .await;
+        assert_ok(&state, "get_state");
+        assert_eq!(state["data"]["sessionId"], original_session_id);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_session_switch_events_are_emitted_for_new_and_resume() {
+    let harness = TestHarness::new("rpc_session_switch_events_are_emitted_for_new_and_resume");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let current_root = tempfile::tempdir().expect("current session dir");
+        let mut current = Session::create_with_dir(Some(current_root.path().to_path_buf()));
+        current.append_message(SessionMessage::User {
+            content: UserContent::Text("current".to_string()),
+            timestamp: Some(1_700_000_000_000),
+        });
+        current.save().await.expect("save current session");
+        let current_path = current
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("current session path");
+
+        let target_root = tempfile::tempdir().expect("target session dir");
+        let mut target = Session::create_with_dir(Some(target_root.path().to_path_buf()));
+        target.append_message(SessionMessage::User {
+            content: UserContent::Text("target".to_string()),
+            timestamp: Some(1_700_000_000_100),
+        });
+        target.save().await.expect("save target session");
+        let target_path = target
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("target session path");
+
+        let (agent_session, manager) = build_agent_session_with_js_extension(
+            current,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_RECORD_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let new_resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"new_session"}"#,
+            "new_session(recorded)",
+        )
+        .await;
+        assert_ok(&new_resp, "new_session");
+        assert_eq!(new_resp["data"]["cancelled"], false);
+
+        let switch_cmd = json!({
+            "id": "2",
+            "type": "switch_session",
+            "sessionPath": target_path.clone(),
+        })
+        .to_string();
+        let switch_resp = send_recv(&in_tx, &out_rx, &switch_cmd, "switch_session(recorded)").await;
+        assert_ok(&switch_resp, "switch_session");
+        assert_eq!(switch_resp["data"]["cancelled"], false);
+
+        let events_json = manager
+            .execute_command("get-events", "", 5000)
+            .await
+            .expect("get recorded events");
+        let events: Vec<Value> = serde_json::from_str(events_json.as_str().expect("events string"))
+            .expect("parse events");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "expected new + resume events, got {events:?}"
+        );
+        assert_eq!(events[0]["reason"], "new");
+        assert_eq!(events[0]["previousSessionFile"], current_path);
+        assert!(
+            events[0]["sessionId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "expected new-session event to include sessionId: {:?}",
+            events[0]
+        );
+
+        assert_eq!(events[1]["reason"], "resume");
+        assert_eq!(events[1]["previousSessionFile"], Value::Null);
+        assert_eq!(events[1]["targetSessionFile"], target_path);
+        assert!(
+            events[1]["sessionId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "expected resume event to include sessionId: {:?}",
+            events[1]
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
 }
 
 // ---------------------------------------------------------------------------

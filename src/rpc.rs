@@ -20,7 +20,10 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
+use crate::extensions::{
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionUiRequest,
+    ExtensionUiResponse,
+};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -153,6 +156,40 @@ fn is_extension_command(message: &str, expanded: &str) -> bool {
     // Extension commands start with `/` but are not expanded by the resource loader
     // (skills and prompt templates are expanded before queueing/sending).
     message.trim_start().starts_with('/') && message == expanded
+}
+
+async fn rpc_dispatch_session_before_switch(
+    manager: Option<ExtensionManager>,
+    reason: &str,
+    target_session_file: Option<&str>,
+) -> bool {
+    let Some(manager) = manager else {
+        return false;
+    };
+
+    let payload = target_session_file.map_or_else(
+        || json!({ "reason": reason }),
+        |target_session_file| json!({ "reason": reason, "targetSessionFile": target_session_file }),
+    );
+
+    manager
+        .dispatch_cancellable_event(
+            ExtensionEventName::SessionBeforeSwitch,
+            Some(payload),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await
+        .unwrap_or(false)
+}
+
+async fn rpc_dispatch_session_switch_event(manager: Option<ExtensionManager>, payload: Value) {
+    let Some(manager) = manager else {
+        return;
+    };
+
+    let _ = manager
+        .dispatch_event(ExtensionEventName::SessionSwitch, Some(payload))
+        .await;
 }
 
 fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
@@ -1364,16 +1401,27 @@ pub async fn run(
             }
 
             "new_session" => {
+                if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
+                    .await
+                {
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "new_session",
+                        Some(json!({ "cancelled": true })),
+                    ));
+                    continue;
+                }
+
                 let parent = parsed
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                {
+                let (session_id, previous_session_file) = {
                     let mut guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let (session_dir, provider, model_id, thinking_level) = {
+                    let (session_dir, provider, model_id, thinking_level, previous_session_file) = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
@@ -1382,6 +1430,7 @@ pub async fn run(
                             inner_session.header.provider.clone(),
                             inner_session.header.model_id.clone(),
                             inner_session.header.thinking_level.clone(),
+                            inner_session.path.as_ref().map(|p| p.display().to_string()),
                         )
                     };
                     let mut new_session = if guard.save_enabled() {
@@ -1406,8 +1455,10 @@ pub async fn run(
                         *inner_session = new_session;
                     }
                     guard.agent.clear_messages();
-                    guard.agent.stream_options_mut().session_id = Some(session_id);
-                }
+                    guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+
+                    (session_id, previous_session_file)
+                };
                 {
                     let mut state = shared_state
                         .lock(&cx)
@@ -1416,6 +1467,15 @@ pub async fn run(
                     state.steering.clear();
                     state.follow_up.clear();
                 }
+                rpc_dispatch_session_switch_event(
+                    rpc_extension_manager.clone(),
+                    json!({
+                        "reason": "new",
+                        "previousSessionFile": previous_session_file,
+                        "sessionId": session_id,
+                    }),
+                )
+                .await;
                 let _ = out_tx.send(response_ok(
                     id,
                     "new_session",
@@ -1433,11 +1493,31 @@ pub async fn run(
                     continue;
                 };
 
+                if rpc_dispatch_session_before_switch(
+                    rpc_extension_manager.clone(),
+                    "resume",
+                    Some(session_path),
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "switch_session",
+                        Some(json!({ "cancelled": true })),
+                    ));
+                    continue;
+                }
+
                 let loaded = crate::session::Session::open(session_path).await;
                 match loaded {
                     Ok(new_session) => {
+                        let target_session_file = new_session
+                            .path
+                            .as_ref()
+                            .map_or_else(|| session_path.to_string(), |p| p.display().to_string());
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        let previous_session_file;
                         let mut guard = session
                             .lock(&cx)
                             .await
@@ -1447,21 +1527,37 @@ pub async fn run(
                                 guard.session.lock(&cx).await.map_err(|err| {
                                     Error::session(format!("inner session lock failed: {err}"))
                                 })?;
+                            previous_session_file =
+                                inner_session.path.as_ref().map(|p| p.display().to_string());
                             *inner_session = new_session;
                         }
                         guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id);
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "switch_session",
-                            Some(json!({ "cancelled": false })),
-                        ));
+                        guard.agent.stream_options_mut().session_id = Some(session_id.clone());
                         let mut state = shared_state
                             .lock(&cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                         state.steering.clear();
                         state.follow_up.clear();
+                        drop(state);
+                        drop(guard);
+
+                        rpc_dispatch_session_switch_event(
+                            rpc_extension_manager.clone(),
+                            json!({
+                                "reason": "resume",
+                                "previousSessionFile": previous_session_file,
+                                "targetSessionFile": target_session_file,
+                                "sessionId": session_id,
+                            }),
+                        )
+                        .await;
+
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "switch_session",
+                            Some(json!({ "cancelled": false })),
+                        ));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
