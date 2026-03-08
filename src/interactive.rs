@@ -200,24 +200,10 @@ impl TmuxWheelGuard {
         // Override WheelUp and WheelDown for this pane to send-keys
         // (i.e. forward the escape sequences to the application).
         let _ = std::process::Command::new("tmux")
-            .args([
-                "bind-key",
-                "-T",
-                "root",
-                "WheelUpPane",
-                "send-keys",
-                "-M",
-            ])
+            .args(["bind-key", "-T", "root", "WheelUpPane", "send-keys", "-M"])
             .status();
         let _ = std::process::Command::new("tmux")
-            .args([
-                "bind-key",
-                "-T",
-                "root",
-                "WheelDownPane",
-                "send-keys",
-                "-M",
-            ])
+            .args(["bind-key", "-T", "root", "WheelDownPane", "send-keys", "-M"])
             .status();
 
         Some(Self {
@@ -257,9 +243,7 @@ impl TmuxWheelGuard {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 // Re-run the full bind-key command via tmux.
-                let _ = std::process::Command::new("tmux")
-                    .args(&parts)
-                    .status();
+                let _ = std::process::Command::new("tmux").args(&parts).status();
             }
         } else {
             // No previous binding — unbind to revert to tmux default behavior.
@@ -2184,8 +2168,7 @@ impl PiApp {
         // scroll the conversation viewport.
         if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
             if mouse.is_wheel()
-                && (mouse.button == MouseButton::WheelUp
-                    || mouse.button == MouseButton::WheelDown)
+                && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
             {
                 let is_up = mouse.button == MouseButton::WheelUp;
                 return self.handle_mouse_wheel(is_up);
