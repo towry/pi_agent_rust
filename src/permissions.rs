@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -49,14 +49,14 @@ pub struct PersistedDecision {
 struct PermissionsFile {
     version: u32,
     /// `extension_id` → list of decisions.
-    decisions: HashMap<String, Vec<PersistedDecision>>,
+    decisions: BTreeMap<String, Vec<PersistedDecision>>,
 }
 
 impl Default for PermissionsFile {
     fn default() -> Self {
         Self {
             version: CURRENT_VERSION,
-            decisions: HashMap::new(),
+            decisions: BTreeMap::new(),
         }
     }
 }
@@ -246,7 +246,7 @@ impl PermissionStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Convert internal HashMap → Vec for stable serialization.
+        // Convert internal HashMap → ordered on-disk structure for stable serialization.
         let file = PermissionsFile {
             version: CURRENT_VERSION,
             decisions: {
@@ -326,10 +326,9 @@ fn parse_expiry_timestamp(expires_at: &str) -> Option<DateTime<Utc>> {
 }
 
 fn decision_is_active(decision: &PersistedDecision, now: DateTime<Utc>) -> bool {
-    match decision.expires_at.as_deref() {
-        Some(expires_at) => parse_expiry_timestamp(expires_at).is_some_and(|expiry| now <= expiry),
-        None => true,
-    }
+    decision.expires_at.as_deref().is_none_or(|expires_at| {
+        parse_expiry_timestamp(expires_at).is_some_and(|expiry| now <= expiry)
+    })
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -653,7 +652,7 @@ mod tests {
 
     #[test]
     fn permissions_file_serde_roundtrip() {
-        let mut decisions = HashMap::new();
+        let mut decisions = BTreeMap::new();
         decisions.insert(
             "ext-a".to_string(),
             vec![PersistedDecision {
