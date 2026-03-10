@@ -652,7 +652,7 @@ fn request_header_mutators_update_hostcall_headers() {
                 resolve({
                     result: JSON.stringify({
                         initial: req.getHeader('X-Initial'),
-                        afterSet: req.getHeader('content-type') + '|' + req.getHeader('x-custom'),
+                        afterSet,
                         afterRemove: String(req.getHeader('x-custom')),
                         sent: JSON.parse(body),
                     }),
@@ -661,6 +661,7 @@ fn request_header_mutators_update_hostcall_headers() {
         });
         req.setHeader('Content-Type', 'application/json');
         req.setHeader('X-Custom', 'value');
+        const afterSet = req.getHeader('content-type') + '|' + req.getHeader('x-custom');
         req.removeHeader('X-Custom');
         req.end();
         ",

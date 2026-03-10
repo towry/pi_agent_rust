@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -36,6 +37,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
+const V2_CHAIN_HASH_GENESIS: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn finish_worker_result<T, E>(
     handle: thread::JoinHandle<()>,
@@ -619,6 +622,8 @@ pub struct Session {
     v2_partial_hydration: bool,
     /// Resume mode used when loading from V2 sidecar.
     v2_resume_mode: Option<V2OpenMode>,
+    /// True when the JSONL file has advanced beyond the loaded V2 sidecar.
+    v2_sidecar_stale: bool,
     /// Offset to add to `cached_message_count` to account for messages not loaded in memory
     /// (e.g. when using V2 tail hydration).
     v2_message_count_offset: u64,
@@ -651,6 +656,7 @@ impl Clone for Session {
             v2_sidecar_root: self.v2_sidecar_root.clone(),
             v2_partial_hydration: self.v2_partial_hydration,
             v2_resume_mode: self.v2_resume_mode,
+            v2_sidecar_stale: self.v2_sidecar_stale,
             v2_message_count_offset: self.v2_message_count_offset,
         }
     }
@@ -1042,6 +1048,7 @@ impl Session {
             v2_sidecar_root: None,
             v2_partial_hydration: false,
             v2_resume_mode: None,
+            v2_sidecar_stale: false,
             v2_message_count_offset: 0,
         }
     }
@@ -1081,6 +1088,7 @@ impl Session {
             v2_sidecar_root: None,
             v2_partial_hydration: false,
             v2_resume_mode: None,
+            v2_sidecar_stale: false,
             v2_message_count_offset: 0,
         }
     }
@@ -1120,23 +1128,8 @@ impl Session {
 
         // Check for V2 sidecar store — enables O(index+tail) resume.
         if session_store_v2::has_v2_sidecar(&path) {
-            let is_stale = (|| -> Option<bool> {
-                let jsonl_meta = std::fs::metadata(&path).ok()?;
-
-                let v2_root = session_store_v2::v2_sidecar_path(&path);
-                let v2_index = v2_root.join("index").join("offsets.jsonl");
-                let v2_manifest = v2_root.join("manifest.json");
-
-                // Check index first, fallback to manifest
-                let v2_meta = std::fs::metadata(&v2_index)
-                    .or_else(|_| std::fs::metadata(&v2_manifest))
-                    .ok()?;
-
-                let jsonl_mtime = jsonl_meta.modified().ok()?;
-                let v2_mtime = v2_meta.modified().ok()?;
-                Some(jsonl_mtime > v2_mtime)
-            })()
-            .unwrap_or(true); // Default to true (stale) if metadata cannot be verified
+            let v2_root = session_store_v2::v2_sidecar_path(&path);
+            let is_stale = is_v2_sidecar_stale(&path, &v2_root);
 
             if is_stale {
                 tracing::warn!(
@@ -1235,6 +1228,7 @@ impl Session {
                 v2_sidecar_root: None,
                 v2_partial_hydration: !matches!(mode, V2OpenMode::Full),
                 v2_resume_mode: Some(mode),
+                v2_sidecar_stale: false,
                 v2_message_count_offset,
             },
             diagnostics,
@@ -1298,6 +1292,7 @@ impl Session {
             v2_sidecar_root: None,
             v2_partial_hydration: false,
             v2_resume_mode: None,
+            v2_sidecar_stale: false,
             v2_message_count_offset: 0,
         })
     }
@@ -1478,14 +1473,28 @@ impl Session {
             .min(self.entries.len());
         let previous_mode = self.v2_resume_mode;
 
-        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
-        let (fully_hydrated, diagnostics) =
-            Self::open_from_v2(&store, self.header.clone(), V2OpenMode::Full)?;
+        let use_jsonl_rehydration = self
+            .path
+            .as_ref()
+            .is_some_and(|path| self.v2_sidecar_stale || is_v2_sidecar_stale(path, &v2_root));
+        let (fully_hydrated, diagnostics, rehydration_source) = if use_jsonl_rehydration {
+            let path = self.path.clone().ok_or_else(|| {
+                Error::session("missing JSONL path while rehydrating stale V2 session")
+            })?;
+            let (session, diagnostics) = open_jsonl_blocking(path)?;
+            (session, diagnostics, "jsonl")
+        } else {
+            let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+            let (session, diagnostics) =
+                Self::open_from_v2(&store, self.header.clone(), V2OpenMode::Full)?;
+            (session, diagnostics, "v2")
+        };
         if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
         {
             tracing::error!(
                 skipped_entries = diagnostics.skipped_entries.len(),
                 orphaned_parent_links = diagnostics.orphaned_parent_links.len(),
+                rehydration_source,
                 "full V2 rehydration before save failed integrity check; aborting save to prevent data loss"
             );
             return Err(Error::session(format!(
@@ -1520,10 +1529,12 @@ impl Session {
             .store(persisted_entry_count, Ordering::SeqCst);
         self.v2_partial_hydration = false;
         self.v2_resume_mode = Some(V2OpenMode::Full);
+        self.v2_sidecar_stale = false;
         self.v2_message_count_offset = 0;
 
         tracing::debug!(
             previous_mode = ?previous_mode,
+            rehydration_source,
             persisted_entry_count,
             pending_entries = self.entries.len().saturating_sub(persisted_entry_count),
             "fully rehydrated V2 session before save"
@@ -1700,6 +1711,7 @@ impl Session {
                                 .store(self.entries.len(), Ordering::SeqCst);
                             self.header_dirty = false;
                             self.appends_since_checkpoint = 0;
+                            self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
                             Ok(())
                         }
                         Err(err) => Err(err),
@@ -1776,6 +1788,7 @@ impl Session {
                             self.persisted_entry_count
                                 .store(new_count, Ordering::SeqCst);
                             self.appends_since_checkpoint += 1;
+                            self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
                         }
                         result?;
                     }
@@ -3831,6 +3844,7 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             v2_sidecar_root: None,
             v2_partial_hydration: false,
             v2_resume_mode: None,
+            v2_sidecar_stale: false,
             v2_message_count_offset: 0,
         },
         diagnostics,
@@ -4153,6 +4167,7 @@ pub fn verify_v2_against_jsonl(
     })?;
 
     let mut jsonl_ids: Vec<String> = Vec::new();
+    let mut jsonl_chain_hash = V2_CHAIN_HASH_GENESIS.to_string();
     for line_res in reader.lines() {
         let line = line_res.map_err(|e| crate::Error::Io(Box::new(e)))?;
         if line.trim().is_empty() {
@@ -4165,6 +4180,7 @@ pub fn verify_v2_against_jsonl(
             .cloned()
             .ok_or_else(|| crate::Error::session("SessionEntry has no id"))?;
         jsonl_ids.push(id);
+        jsonl_chain_hash = session_entry_chain_hash_step(&jsonl_chain_hash, &entry)?;
     }
 
     // Read V2 store entries.
@@ -4176,14 +4192,46 @@ pub fn verify_v2_against_jsonl(
     // Check hash chain via validate_integrity (which also verifies checksums).
     let index_consistent = store.validate_integrity().is_ok();
 
-    // Hash chain is validated as part of integrity validation for the store.
-    let hash_chain_match = index_consistent;
+    let hash_chain_match = jsonl_chain_hash == store.chain_hash();
 
     Ok(session_store_v2::MigrationVerification {
         entry_count_match,
         hash_chain_match,
         index_consistent,
     })
+}
+
+fn is_v2_sidecar_stale(jsonl_path: &Path, v2_root: &Path) -> bool {
+    let Some(jsonl_meta) = std::fs::metadata(jsonl_path).ok() else {
+        return true;
+    };
+
+    let v2_index = v2_root.join("index").join("offsets.jsonl");
+    let v2_manifest = v2_root.join("manifest.json");
+    let Some(v2_meta) = std::fs::metadata(&v2_index)
+        .or_else(|_| std::fs::metadata(&v2_manifest))
+        .ok()
+    else {
+        return true;
+    };
+
+    let Some(jsonl_mtime) = jsonl_meta.modified().ok() else {
+        return true;
+    };
+    let Some(v2_mtime) = v2_meta.modified().ok() else {
+        return true;
+    };
+
+    jsonl_mtime > v2_mtime
+}
+
+fn session_entry_chain_hash_step(prev_chain: &str, entry: &SessionEntry) -> Result<String> {
+    let (_, _, _, payload) = session_store_v2::session_entry_to_frame_args(entry)?;
+    let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
+    let mut hasher = Sha256::new();
+    hasher.update(prev_chain.as_bytes());
+    hasher.update(payload_sha256.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Remove a V2 sidecar, reverting to JSONL-only storage.
@@ -4712,6 +4760,112 @@ mod tests {
             "pending entry appended on partial session must be preserved"
         );
         assert_eq!(reopened_ids.len(), 5);
+    }
+
+    #[test]
+    fn v2_partial_hydration_full_rewrite_uses_newer_jsonl_when_sidecar_is_stale() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lazy_hydration_stale_sidecar.jsonl");
+
+        let mut seed = Session::create();
+        seed.path = Some(path.clone());
+        let _id_root = seed.append_message(make_test_message("root"));
+        let id_a = seed.append_message(make_test_message("a"));
+        let id_b = seed.append_message(make_test_message("main-branch"));
+        assert!(seed.create_branch_from(&id_a));
+        let _id_c = seed.append_message(make_test_message("side-branch"));
+        run_async(async { seed.save().await }).unwrap();
+
+        create_v2_sidecar_from_jsonl(&path).unwrap();
+        let v2_root = crate::session_store_v2::v2_sidecar_path(&path);
+        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024).unwrap();
+        let (mut loaded, _) =
+            Session::open_from_v2(&store, seed.header.clone(), V2OpenMode::ActivePath).unwrap();
+        loaded.path = Some(path.clone());
+        loaded.v2_sidecar_root = Some(v2_root.clone());
+        loaded.v2_partial_hydration = true;
+        loaded.v2_resume_mode = Some(V2OpenMode::ActivePath);
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let new_id = loaded.append_message(make_test_message("saved-before-full-rewrite"));
+        run_async(async { loaded.save().await }).unwrap();
+        assert!(
+            is_v2_sidecar_stale(&path, &v2_root),
+            "incremental JSONL save should make sidecar stale"
+        );
+
+        loaded.set_model_header(Some("provider-updated".to_string()), None, None);
+        run_async(async { loaded.save().await }).unwrap();
+
+        let (reopened, _) =
+            run_async(async { Session::open_jsonl_with_diagnostics(&path).await }).unwrap();
+        let reopened_ids: Vec<String> = reopened
+            .entries
+            .iter()
+            .filter_map(|entry| entry.base().id.clone())
+            .collect();
+        assert!(
+            reopened_ids.contains(&id_b),
+            "non-active branch entry must survive full rewrite after stale sidecar"
+        );
+        assert!(
+            reopened_ids.contains(&new_id),
+            "entry already saved to JSONL must not be dropped during rehydrate"
+        );
+        assert_eq!(reopened_ids.len(), 5);
+    }
+
+    #[test]
+    fn verify_v2_against_jsonl_detects_payload_mismatch_with_matching_ids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("verify_v2_payload_mismatch.jsonl");
+
+        let mut session = Session::create();
+        session.path = Some(path.clone());
+        session.append_message(make_test_message("alpha"));
+        session.append_message(make_test_message("beta"));
+        run_async(async { session.save().await }).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let _header_line = lines.next().expect("header");
+        let mut tampered_entries: Vec<SessionEntry> = lines
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("parse session entry"))
+            .collect();
+
+        let SessionEntry::Message(message_entry) = tampered_entries
+            .first_mut()
+            .expect("first tampered entry should exist")
+        else {
+            panic!("expected message entry");
+        };
+        let SessionMessage::User {
+            content: UserContent::Text(text),
+            ..
+        } = &mut message_entry.message
+        else {
+            panic!("expected user text message");
+        };
+        *text = "alpha-tampered".to_string();
+
+        let tampered_root = temp_dir.path().join("verify_v2_payload_mismatch.v2");
+        let mut tampered_store = SessionStoreV2::create(&tampered_root, 64 * 1024 * 1024).unwrap();
+        for entry in &tampered_entries {
+            let (entry_id, parent_entry_id, entry_type, payload) =
+                session_store_v2::session_entry_to_frame_args(entry).unwrap();
+            tampered_store
+                .append_entry(entry_id, parent_entry_id, entry_type, payload)
+                .unwrap();
+        }
+
+        let verification = verify_v2_against_jsonl(&path, &tampered_store).unwrap();
+        assert!(verification.entry_count_match);
+        assert!(verification.index_consistent);
+        assert!(
+            !verification.hash_chain_match,
+            "payload divergence must fail migration verification even when entry ids match"
+        );
     }
 
     #[test]
