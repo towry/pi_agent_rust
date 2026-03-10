@@ -20622,13 +20622,18 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(requests.len(), 1);
             assert!(matches!(&requests[0].kind, HostcallKind::Http));
 
-            let payload = requests[0].payload.as_object().expect("http payload object");
+            let payload = requests[0]
+                .payload
+                .as_object()
+                .expect("http payload object");
             assert_eq!(
                 payload.get("method").and_then(serde_json::Value::as_str),
                 Some("POST")
             );
             assert_eq!(
-                payload.get("body_bytes").and_then(serde_json::Value::as_str),
+                payload
+                    .get("body_bytes")
+                    .and_then(serde_json::Value::as_str),
                 Some("AAEC/w==")
             );
             assert!(
