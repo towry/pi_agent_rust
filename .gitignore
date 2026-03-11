@@ -58,6 +58,9 @@ _tmp_*/
 _target_*/
 _target-*/
 
+# Per-agent remote build directories created by rch
+.rch-target-*/
+
 # Benchmark result directories
 .bench*/
 
