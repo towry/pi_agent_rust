@@ -62,6 +62,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             details: message.details,
             timestamp: Utc::now().timestamp_millis(),
         });
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         let is_streaming = self.extension_streaming.load(Ordering::SeqCst);
         if is_streaming {
@@ -69,9 +70,12 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             self.queue_custom_message(message.deliver_as, custom_message.clone())?;
             if let ModelMessage::Custom(custom) = &custom_message {
                 if custom.display {
-                    let _ = self
-                        .event_tx
-                        .try_send(PiMsg::SystemNote(custom.content.clone()));
+                    let _ = enqueue_pi_event(
+                        &self.event_tx,
+                        &cx,
+                        PiMsg::SystemNote(custom.content.clone()),
+                    )
+                    .await;
                 }
             }
             return Ok(());
@@ -80,23 +84,28 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         // Agent is idle: persist immediately and update in-memory history so it affects the next run.
         self.append_to_session(custom_message.clone()).await?;
 
-        let cx = Cx::current().unwrap_or_else(Cx::for_request);
         if let Ok(mut agent_guard) = self.agent.lock(&cx).await {
             agent_guard.add_message(custom_message.clone());
         }
 
         if let ModelMessage::Custom(custom) = &custom_message {
             if custom.display {
-                let _ = self
-                    .event_tx
-                    .try_send(PiMsg::SystemNote(custom.content.clone()));
+                let _ = enqueue_pi_event(
+                    &self.event_tx,
+                    &cx,
+                    PiMsg::SystemNote(custom.content.clone()),
+                )
+                .await;
             }
         }
 
         if Self::should_trigger_turn(message.deliver_as, message.trigger_turn) {
-            let _ = self
-                .event_tx
-                .try_send(PiMsg::EnqueuePendingInput(PendingInput::Continue));
+            let _ = enqueue_pi_event(
+                &self.event_tx,
+                &cx,
+                PiMsg::EnqueuePendingInput(PendingInput::Continue),
+            )
+            .await;
         }
 
         Ok(())
@@ -121,9 +130,13 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             return Ok(());
         }
 
-        let _ = self
-            .event_tx
-            .try_send(PiMsg::EnqueuePendingInput(PendingInput::Text(message.text)));
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let _ = enqueue_pi_event(
+            &self.event_tx,
+            &cx,
+            PiMsg::EnqueuePendingInput(PendingInput::Text(message.text)),
+        )
+        .await;
         Ok(())
     }
 }
@@ -629,6 +642,10 @@ mod tests {
     }
 
     fn build_host_actions() -> HostActionsHarness {
+        build_host_actions_with_capacity(8)
+    }
+
+    fn build_host_actions_with_capacity(capacity: usize) -> HostActionsHarness {
         let session = Arc::new(Mutex::new(Session::in_memory()));
         let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
         let agent = Arc::new(Mutex::new(Agent::new(
@@ -636,7 +653,7 @@ mod tests {
             ToolRegistry::new(&[], Path::new("."), None),
             AgentConfig::default(),
         )));
-        let (event_tx, event_rx) = mpsc::channel(8);
+        let (event_tx, event_rx) = mpsc::channel(capacity);
         (
             InteractiveExtensionHostActions {
                 session: Arc::clone(&session),
@@ -863,6 +880,123 @@ mod tests {
                 event_rx.try_recv().is_err(),
                 "nextTurn should stay deferred even when triggerTurn is set"
             );
+        });
+    }
+
+    #[test]
+    fn streaming_send_message_preserves_display_note_under_backpressure() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let (actions, event_rx, _session, _agent) = build_host_actions_with_capacity(1);
+            actions.extension_streaming.store(true, Ordering::SeqCst);
+            actions
+                .event_tx
+                .try_send(PiMsg::System("busy".to_string()))
+                .expect("fill bounded event channel");
+
+            let send_message = actions.send_message(ExtensionSendMessage {
+                extension_id: Some("ext".to_string()),
+                custom_type: "note".to_string(),
+                content: "visible".to_string(),
+                display: true,
+                details: None,
+                deliver_as: Some(ExtensionDeliverAs::Steer),
+                trigger_turn: false,
+            });
+            let recv_cx = Cx::for_request();
+            let recv_messages = async {
+                let first = event_rx.recv(&recv_cx).await.expect("busy message");
+                let second = event_rx.recv(&recv_cx).await.expect("display note");
+                (first, second)
+            };
+
+            let (result, (first, second)) = futures::join!(send_message, recv_messages);
+
+            result.expect("send_message");
+            assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+            assert!(matches!(second, PiMsg::SystemNote(text) if text == "visible"));
+        });
+    }
+
+    #[test]
+    fn idle_send_message_preserves_display_and_continue_under_backpressure() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let (actions, event_rx, _session, _agent) = build_host_actions_with_capacity(1);
+            actions
+                .event_tx
+                .try_send(PiMsg::System("busy".to_string()))
+                .expect("fill bounded event channel");
+
+            let send_message = actions.send_message(ExtensionSendMessage {
+                extension_id: Some("ext".to_string()),
+                custom_type: "note".to_string(),
+                content: "continue-now".to_string(),
+                display: true,
+                details: None,
+                deliver_as: Some(ExtensionDeliverAs::Steer),
+                trigger_turn: true,
+            });
+            let recv_cx = Cx::for_request();
+            let recv_messages = async {
+                let first = event_rx.recv(&recv_cx).await.expect("busy message");
+                let second = event_rx.recv(&recv_cx).await.expect("display note");
+                let third = event_rx.recv(&recv_cx).await.expect("continue enqueue");
+                (first, second, third)
+            };
+
+            let (result, (first, second, third)) = futures::join!(send_message, recv_messages);
+
+            result.expect("send_message");
+            assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+            assert!(matches!(second, PiMsg::SystemNote(text) if text == "continue-now"));
+            assert!(matches!(
+                third,
+                PiMsg::EnqueuePendingInput(PendingInput::Continue)
+            ));
+        });
+    }
+
+    #[test]
+    fn idle_send_user_message_preserves_text_under_backpressure() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let (actions, event_rx, _session, _agent) = build_host_actions_with_capacity(1);
+            actions
+                .event_tx
+                .try_send(PiMsg::System("busy".to_string()))
+                .expect("fill bounded event channel");
+
+            let send_message = actions.send_user_message(ExtensionSendUserMessage {
+                extension_id: Some("ext".to_string()),
+                text: "hello from extension".to_string(),
+                deliver_as: None,
+            });
+            let recv_cx = Cx::for_request();
+            let recv_messages = async {
+                let first = event_rx.recv(&recv_cx).await.expect("busy message");
+                let second = event_rx.recv(&recv_cx).await.expect("user input enqueue");
+                (first, second)
+            };
+
+            let (result, (first, second)) = futures::join!(send_message, recv_messages);
+
+            result.expect("send_user_message");
+            assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+            assert!(matches!(
+                second,
+                PiMsg::EnqueuePendingInput(PendingInput::Text(text))
+                    if text == "hello from extension"
+            ));
         });
     }
 
