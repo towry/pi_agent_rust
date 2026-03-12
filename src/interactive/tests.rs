@@ -240,6 +240,61 @@ fn enqueue_pi_event_preserves_conversation_reset_under_backpressure() {
 }
 
 #[test]
+fn enqueue_pi_event_current_uses_ambient_context_under_backpressure() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let current_cx = Cx::for_testing();
+        let _guard = Cx::set_current(Some(current_cx));
+        let recv_cx = Cx::for_request();
+        let send_system =
+            enqueue_pi_event_current(&event_tx, PiMsg::System("queued".to_string()));
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx.recv(&recv_cx).await.expect("second queued message");
+            (first, second)
+        };
+
+        let (enqueued, (first, second)) = futures::join!(send_system, recv_messages);
+
+        assert!(enqueued, "ambient context send should survive backpressure");
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(matches!(second, PiMsg::System(text) if text == "queued"));
+    });
+}
+
+#[test]
+fn enqueue_pi_event_current_respects_ambient_context_cancellation() {
+    asupersync::test_utils::run_test(|| async {
+        use asupersync::channel::mpsc::RecvError;
+        use asupersync::types::CancelKind;
+
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let current_cx = Cx::for_testing();
+        current_cx.cancel_with(CancelKind::User, Some("cancel stale UI send"));
+        let _guard = Cx::set_current(Some(current_cx));
+
+        let enqueued = enqueue_pi_event_current(&event_tx, PiMsg::System("stale".to_string())).await;
+        assert!(!enqueued, "cancelled ambient context must reject stale UI sends");
+
+        let recv_cx = Cx::for_request();
+        let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(
+            matches!(event_rx.try_recv(), Err(RecvError::Empty)),
+            "cancelled send should not enqueue a follow-on message"
+        );
+    });
+}
+
+#[test]
 fn tmux_wheel_guard_extracts_saved_binding_command() {
     let line = r##"bind-key -T root WheelUpPane            if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##;
     assert_eq!(
