@@ -884,7 +884,7 @@ impl PiApp {
             let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
                 Ok(a) => a,
                 Err(e) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(e.to_string())).await;
                     return;
                 }
             };
@@ -1009,19 +1009,19 @@ impl PiApp {
             let credential = match credential {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(e.to_string())).await;
                     return;
                 }
             };
 
             save_provider_credential(&mut auth, &provider, credential);
             if let Err(e) = auth.save_async().await {
-                let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(e.to_string())).await;
                 return;
             }
-            let _ = event_tx.try_send(PiMsg::CredentialUpdated {
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::CredentialUpdated {
                 provider: provider.clone(),
-            });
+            }).await;
 
             let status = match kind {
                 PendingLoginKind::ApiKey => {
@@ -1033,7 +1033,7 @@ impl PiApp {
                     )
                 }
             };
-            let _ = event_tx.try_send(PiMsg::System(status));
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::System(status)).await;
         });
 
         None
@@ -1108,24 +1108,24 @@ impl PiApp {
 
                         let mut display = display;
                         display.push_str("\n\n[Output excluded from model context]");
-                        let _ = event_tx.try_send(PiMsg::BashResult {
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::BashResult {
                             display,
                             content_for_agent: None,
-                        });
+                        }).await;
                     } else {
                         let content_for_agent =
                             vec![ContentBlock::Text(TextContent::new(display.clone()))];
-                        let _ = event_tx.try_send(PiMsg::BashResult {
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::BashResult {
                             display,
                             content_for_agent: Some(content_for_agent),
-                        });
+                        }).await;
                     }
                 }
                 Err(err) => {
-                    let _ = event_tx.try_send(PiMsg::BashResult {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::BashResult {
                         display: format!("Bash command failed: {err}"),
                         content_for_agent: None,
-                    });
+                    }).await;
                 }
             }
         });
@@ -1531,9 +1531,9 @@ impl PiApp {
                         .await
                         .unwrap_or(false);
                     if cancelled {
-                        let _ = event_tx.try_send(PiMsg::System(
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::System(
                             "Session switch cancelled by extension".to_string(),
-                        ));
+                        )).await;
                         return;
                     }
 
@@ -1541,9 +1541,9 @@ impl PiApp {
                         let mut guard = match session.lock(&cx).await {
                             Ok(guard) => guard,
                             Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!(
                                     "Failed to lock session: {err}"
-                                )));
+                                ))).await;
                                 return;
                             }
                         };
@@ -1561,9 +1561,9 @@ impl PiApp {
                         let mut agent_guard = match agent.lock(&cx).await {
                             Ok(guard) => guard,
                             Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!(
                                     "Failed to lock agent: {err}"
-                                )));
+                                ))).await;
                                 return;
                             }
                         };
@@ -1571,13 +1571,13 @@ impl PiApp {
                         agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
                     }
 
-                    let _ = event_tx.try_send(PiMsg::ConversationReset {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ConversationReset {
                         messages: Vec::new(),
                         usage: Usage::default(),
                         status: Some(format!(
                             "Started new session\nModel set to {model_label}\nThinking level: off"
                         )),
-                    });
+                    }).await;
 
                     let _ = extensions
                         .dispatch_event(
@@ -2335,16 +2335,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         let _ = write!(status, " ({diag_count} diagnostics)");
                     }
 
-                    let _ = event_tx.try_send(PiMsg::ResourcesReloaded {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ResourcesReloaded {
                         resources,
                         status,
                         diagnostics,
-                    });
+                    }).await;
                 }
                 Err(err) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!(
                         "Failed to reload resources: {err}"
-                    )));
+                    ))).await;
                 }
             }
         });

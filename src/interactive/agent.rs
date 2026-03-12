@@ -1001,14 +1001,14 @@ impl PiApp {
                     } else {
                         format!("/{cmd_for_msg} completed: {value}")
                     };
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ExtensionCommandDone {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ExtensionCommandDone {
                         command: cmd_for_msg,
                         display,
                         is_error: false,
                     }).await;
                 }
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ExtensionCommandDone {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ExtensionCommandDone {
                         command: cmd_for_msg,
                         display: format!("Extension command error: {err}"),
                         is_error: true,
@@ -1060,14 +1060,14 @@ impl PiApp {
             match result {
                 Ok(_) => {
                     let display = format!("Shortcut [{key_for_msg}] executed.");
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ExtensionCommandDone {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ExtensionCommandDone {
                         command: key_for_msg,
                         display,
                         is_error: false,
                     }).await;
                 }
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ExtensionCommandDone {
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ExtensionCommandDone {
                         command: key_for_msg,
                         display: format!("Shortcut error: {err}"),
                         is_error: true,
@@ -1217,8 +1217,7 @@ impl PiApp {
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock agent: {err}"))).await;
                         return;
                     }
                 };
@@ -1260,8 +1259,7 @@ impl PiApp {
                 {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
                         return;
                     }
                 };
@@ -1278,12 +1276,12 @@ impl PiApp {
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err)).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err)).await;
             }
 
             if let Err(err) = result {
                 let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(formatted)).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(formatted)).await;
             }
         });
 
@@ -1354,18 +1352,17 @@ impl PiApp {
                         content_for_agent = build_content_blocks_for_input(&text, &images);
                         let updated = content_blocks_to_text(&content_for_agent);
                         if updated != display_owned {
-                            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::UpdateLastUserMessage(updated)).await;
+                            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::UpdateLastUserMessage(updated)).await;
                         }
                     }
                     Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::UpdateLastUserMessage("[input blocked]".to_string()));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::UpdateLastUserMessage("[input blocked]".to_string())).await;
                         let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(message)).await;
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(message)).await;
                         return;
                     }
                     Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err.to_string())).await;
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err.to_string())).await;
                         return;
                     }
                 }
@@ -1378,8 +1375,7 @@ impl PiApp {
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock agent: {err}"))).await;
                         return;
                     }
                 };
@@ -1421,8 +1417,7 @@ impl PiApp {
                 {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
                         return;
                     }
                 };
@@ -1439,12 +1434,12 @@ impl PiApp {
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err)).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err)).await;
             }
 
             if let Err(err) = result {
                 let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(formatted)).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(formatted)).await;
             }
         });
 
@@ -1589,19 +1584,17 @@ impl PiApp {
                         message_for_agent = text;
                         input_images = images;
                         if message_for_agent != displayed_message {
-                            let _ = event_tx
-                                .try_send(PiMsg::UpdateLastUserMessage(message_for_agent.clone()));
+                            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::UpdateLastUserMessage(message_for_agent.clone())).await;
                         }
                     }
                     Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::UpdateLastUserMessage("[input blocked]".to_string()));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::UpdateLastUserMessage("[input blocked]".to_string())).await;
                         let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(message)).await;
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(message)).await;
                         return;
                     }
                     Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err.to_string())).await;
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err.to_string())).await;
                         return;
                     }
                 }
@@ -1614,8 +1607,7 @@ impl PiApp {
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock agent: {err}"))).await;
                         return;
                     }
                 };
@@ -1681,8 +1673,7 @@ impl PiApp {
                 {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
                         return;
                     }
                 };
@@ -1699,11 +1690,11 @@ impl PiApp {
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err)).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err)).await;
             }
 
             if let Err(err) = result {
-                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(err.to_string())).await;
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(err.to_string())).await;
             }
         });
 
