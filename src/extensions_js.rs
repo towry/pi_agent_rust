@@ -15673,7 +15673,8 @@ function __pi_register_tool(spec) {
     if (__pi_tool_index.has(name)) {
         const existing = __pi_tool_index.get(name);
         if (existing && existing.extensionId !== ext.id) {
-            throw new Error(`registerTool: tool name collision: ${name}`);
+            // First-wins: silently skip re-registration (matches pi-mono v0.55.0+ behavior)
+            return;
         }
     }
 
@@ -15719,7 +15720,8 @@ function __pi_register_command(name, spec) {
     if (__pi_command_index.has(cmd)) {
         const existing = __pi_command_index.get(cmd);
         if (existing && existing.extensionId !== ext.id) {
-            throw new Error(`registerCommand: command name collision: ${cmd}`);
+            // First-wins: silently skip re-registration (matches pi-mono v0.55.0+ behavior)
+            return;
         }
     }
 
